@@ -1,22 +1,6 @@
 """
 Smart Crop DSS — FastAPI Backend  v5.0
 Maharashtra-focused.
-
-What's new in v5:
-  • /recommend-crops returns top_n crops (default 5, max 10), re-ranked by
-    composite_score = AI_confidence×0.40 + (100−risk)×0.35 + budget_fit×0.25
-  • Each crop now includes:
-      affordability   — can_afford, input_cost, budget_remaining, label
-      harvest_days    — ICAR sowing→harvest calendar
-      mandi_prices    — Agmarknet variety-wise min/modal/max + arrival date
-  • Agmarknet fetch uses variety-wise resource (fields: State/District/Market/
-    Commodity/Variety/Min_Price/Max_Price/Modal_Price/Arrival_Date)
-  • GET /mandi-prices/{district}/{crop} — standalone mandi price endpoint
-
-Set in .env:
-  OPENWEATHER_API_KEY = <key>
-  HF_API_TOKEN        = <optional>
-  DATA_GOV_API_KEY    = <key from https://data.gov.in>
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -49,12 +33,12 @@ DB_PATH          = "sightings.db"
 DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "")
 
 # ── In-process cache ─────────────────────────────────────────────────
-_price_cache: dict = {}   # key → {data, fetched_at}
-_msp_cache  : dict = {}   # crop_key → msp price
-_yield_cache: dict = {}   # (district, crop) → yield dict
-_CACHE_TTL = 3600         # 1 hour
+_price_cache: dict = {}
+_msp_cache  : dict = {}
+_yield_cache: dict = {}
+_CACHE_TTL = 3600
 
-# ── Harvest days (sowing → harvest, days) ICAR/PKV/MPKV Maharashtra ──
+# ── Harvest days ──────────────────────────────────────────────────────
 HARVEST_DAYS: dict[str, int] = {
     "rice": 120,       "wheat": 120,        "cotton": 180,
     "soybean": 100,    "soyabean": 100,     "maize": 100,
@@ -132,7 +116,6 @@ _COMMODITY_MAP: dict[str, str] = {
     "ragi": "Ragi (Finger Millet/Nagli/Ragi)",
 }
 
-# ── Static fallback APMC prices ₹/quintal (AGMARKNET 2023-24 averages) ──
 MARKET_PRICES_FALLBACK: dict[str, float] = {
     "rice": 2183,        "wheat": 2275,       "cotton": 6680,
     "soybean": 4600,     "soyabean": 4600,    "maize": 2090,
@@ -149,7 +132,6 @@ MARKET_PRICES_FALLBACK: dict[str, float] = {
     "sesamum": 7830,     "safflower": 5800,
 }
 
-# CACP 2024-25 MSP fallback (₹/quintal)
 MSP_FALLBACK: dict[str, float] = {
     "rice": 2300,     "wheat": 2275,     "cotton": 7121,
     "soybean": 4892,  "soyabean": 4892,  "maize": 2225,
@@ -227,38 +209,26 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Agmarknet — variety-wise prices
-#  Resource: 9ef84268-d588-465a-a308-a864a43d0070
-#  Fields: State | District | Market | Commodity | Variety |
-#          Min_Price | Max_Price | Modal_Price | Arrival_Date
+#  Agmarknet helpers (unchanged from original)
 # ══════════════════════════════════════════════════════════════════════
 
 _AGMARKNET_URL = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
 
 
 async def _fetch_mandi_prices(crop_key: str, district: str) -> Optional[dict]:
-    """
-    Fetches variety-wise min/modal/max prices from the nearest Maharashtra mandi.
-    Returns a structured dict or None if unavailable.
-    """
     if not DATA_GOV_API_KEY:
         return None
-
     cache_key = f"mandi:{district.lower()}:{crop_key}"
     cached = _price_cache.get(cache_key)
     if cached and (datetime.now() - cached["_ts"]).seconds < _CACHE_TTL:
         return {k: v for k, v in cached.items() if k != "_ts"}
-
     commodity = _COMMODITY_MAP.get(crop_key)
     if not commodity:
         return None
-
     mandis = DISTRICT_MANDI.get(district, ["Pune"])
     all_records: list[dict] = []
-
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            # Try nearest mandis first
             for mandi in mandis[:2]:
                 params = {
                     "api-key"            : DATA_GOV_API_KEY,
@@ -276,8 +246,6 @@ async def _fetch_mandi_prices(crop_key: str, district: str) -> Optional[dict]:
                         all_records.append(v)
                 if all_records:
                     break
-
-            # State-wide fallback if no mandi-specific data
             if not all_records:
                 params = {
                     "api-key"            : DATA_GOV_API_KEY,
@@ -292,15 +260,11 @@ async def _fetch_mandi_prices(crop_key: str, district: str) -> Optional[dict]:
                     v = _parse_record(rec)
                     if v:
                         all_records.append(v)
-
     except Exception as e:
         print(f"⚠️  Agmarknet error {district}/{crop_key}: {e}")
         return None
-
     if not all_records:
         return None
-
-    # Best = most recent + highest modal price
     best = sorted(all_records, key=lambda r: (r["arrival_date"], r["modal_price"]), reverse=True)[0]
     result = {
         "mandi_name"  : best["mandi"],
@@ -340,7 +304,6 @@ def _safe_float(val) -> Optional[float]:
 
 
 async def _fetch_agmarknet_modal(crop_key: str) -> Optional[float]:
-    """Simple modal price fetch used for revenue estimates."""
     cache_key = f"modal:{crop_key}"
     cached = _price_cache.get(cache_key)
     if cached and (datetime.now() - cached["_ts"]).seconds < _CACHE_TTL:
@@ -370,7 +333,6 @@ async def _fetch_agmarknet_modal(crop_key: str) -> Optional[float]:
         return None
 
 
-# ── MSP warm-up ───────────────────────────────────────────────────────
 _MSP_RESOURCE = "35be93cd-ab6f-4fdd-859a-e1d2f04b8571"
 _MSP_COMMODITY_MAP = {
     "rice": "Paddy (Common)",   "wheat": "Wheat",
@@ -468,38 +430,40 @@ def district_defaults(district: str):
     return d
 
 
+# ── FIX: Relaxed content-type check for soil image upload ─────────────
+# Some Android/iOS devices send 'application/octet-stream' instead of
+# 'image/jpeg'. We now validate by actually attempting to open the image
+# with Pillow rather than relying solely on the MIME type header.
 @app.post("/analyze-soil-image")
 async def analyze_soil(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "Must be an image file")
     data = await file.read()
+
+    # Validate minimum size first
     if len(data) < 1000:
         raise HTTPException(400, "Image appears empty or corrupt")
+
+    # Try to validate as image using Pillow — much more reliable than MIME type
+    try:
+        from PIL import Image as PILImage
+        import io
+        img = PILImage.open(io.BytesIO(data))
+        img.verify()  # raises if not a valid image
+    except Exception:
+        # Only reject if it truly cannot be opened as an image
+        # content_type check as secondary fallback
+        ct = file.content_type or ""
+        # Allow octet-stream through since many mobile clients send this
+        # for camera images
+        if ct and not ct.startswith("image/") and ct not in (
+            "application/octet-stream", "binary/octet-stream", ""
+        ):
+            raise HTTPException(400, "Must be an image file")
+
     return soil_clf.classify(data)
 
 
 @app.post("/recommend-crops")
 async def recommend_crops(req: CropRequest):
-    """
-    Returns top_n crops ranked by composite score.
-
-    Ranking formula (higher = better):
-      composite = AI_confidence×0.40 + (100−risk_score)×0.35 + budget_fit×0.25
-
-    budget_fit: 100 if comfortably affordable → 10 if over budget.
-    If no budget supplied, budget_fit is treated as 75 (neutral).
-
-    Each crop includes:
-      confidence, npk_score, region_score, suitability, grown_pct, avg_yield
-      risk_score, risk_level, risk_breakdown
-      affordability  (can_afford, input_cost, budget_remaining, label)
-      harvest_days
-      mandi_prices   (mandi_name, variety, min/modal/max price, arrival_date)
-      yield_estimate, revenue_estimate, input_cost_estimate
-      market_signal, explanation
-      rank, composite_score
-    """
-    # Step 1: Get 2× candidates from ML model so re-ranking has headroom
     candidates = crop_rec.recommend(
         req.N, req.P, req.K,
         req.temperature, req.humidity,
@@ -510,24 +474,17 @@ async def recommend_crops(req: CropRequest):
         top_n    = min(req.top_n * 2, 10),
     )
 
-    # Step 2: Enrich all candidates in parallel
     async def _enrich(c: dict) -> dict:
         name     = c["crop_name"]
         crop_key = name.lower()
-
         risk   = risk_eng.score(name, req.season, req.temperature,
                                 req.humidity, req.rainfall, req.land_acres, req.budget)
         afford = risk_eng.affordability(name, req.land_acres, req.budget)
-
         yield_d = _yield_estimate(name, req.land_acres, req.irrigation)
         market  = _market_info(name)
-
-        # Revenue: use live Agmarknet modal price if available
         live_price = await _fetch_agmarknet_modal(crop_key)
         price      = live_price or _msp_cache.get(crop_key) or MARKET_PRICES_FALLBACK.get(crop_key, 3000)
         revenue    = _revenue_from_price(name, req.land_acres, req.irrigation, price)
-
-        # Variety-wise mandi prices (nearest APMC)
         mandi = await _fetch_mandi_prices(crop_key, req.district or "Pune")
         if mandi is None:
             fp = MARKET_PRICES_FALLBACK.get(crop_key)
@@ -543,9 +500,7 @@ async def recommend_crops(req: CropRequest):
                     "all_mandis"  : [],
                     "source"      : "static_fallback",
                 }
-
         harvest_days = HARVEST_DAYS.get(crop_key, 120)
-
         return {
             **c,
             "risk_score"          : risk["total"],
@@ -563,13 +518,12 @@ async def recommend_crops(req: CropRequest):
 
     enriched = list(await asyncio.gather(*[_enrich(c) for c in candidates]))
 
-    # Step 3: Re-rank by composite score
     def _composite(crop: dict) -> float:
         ai_conf    = float(crop["confidence"])
         risk_inv   = 100.0 - float(crop["risk_score"])
         af         = crop["affordability"]
         if af["budget_ratio"] is None:
-            budget_fit = 75.0          # no budget → neutral
+            budget_fit = 75.0
         else:
             r = af["budget_ratio"]
             if r < 0.50:   budget_fit = 100.0
@@ -590,7 +544,6 @@ async def recommend_crops(req: CropRequest):
 
 @app.get("/mandi-prices/{district}/{crop}")
 async def mandi_prices(district: str, crop: str):
-    """Live variety-wise Agmarknet prices for a crop at the nearest Maharashtra mandi."""
     live = await _fetch_mandi_prices(crop.lower(), district)
     if live:
         return live
@@ -732,30 +685,25 @@ def _explain(crop: str, req: CropRequest) -> list[str]:
     prof = CROP_PROFILES.get(crop.lower(), {})
     tlo, thi = prof.get("temp", (20, 33))
     rlo, rhi = prof.get("rain", (400, 1200))
-
     if req.N >= 70:
         pts.append(f"Good nitrogen levels ({req.N:.0f} mg/kg) support strong {crop} growth")
     else:
         pts.append(f"Moderate nitrogen — consider urea top-dressing for {crop}")
-
     if tlo <= req.temperature <= thi:
         pts.append(f"Current temperature ({req.temperature:.0f}°C) is ideal for {crop}")
     else:
         pts.append(f"Temperature ({req.temperature:.0f}°C) is outside ideal range; monitor closely")
-
     if rlo <= req.rainfall <= rhi:
         pts.append(f"Rainfall ({req.rainfall:.0f} mm) meets {crop}'s water requirements")
     elif req.rainfall < rlo:
         pts.append(f"Low rainfall ({req.rainfall:.0f} mm) — irrigation essential for {crop}")
     else:
         pts.append(f"High rainfall ({req.rainfall:.0f} mm) — ensure good drainage for {crop}")
-
     seasons = prof.get("seasons", [])
     if req.season in seasons or not seasons:
         pts.append(f"{req.season} season aligns with {crop}'s optimal growing cycle")
     else:
         pts.append(f"{crop} can be grown in {req.season} but performs best in {'/'.join(seasons)}")
-
     return pts[:4]
 
 DISTRICT_DATA: dict[str, dict] = {
@@ -837,7 +785,6 @@ DISTRICT_DATA: dict[str, dict] = {
         primary_season="Kharif", weather_city="Bhandara",
         common_crops=["Rice","Wheat","Maize","Soybean"],
     ),
-    # ── Marathwada ───────────────────────────────────────────────────
     "Chhatrapati Sambhajinagar": dict(
         region="Marathwada", typical_soil_type="Black Soil",
         npk_range=dict(N_low=50,N_high=75,P_low=40,P_high=68,K_low=70,K_high=110),
@@ -894,7 +841,6 @@ DISTRICT_DATA: dict[str, dict] = {
         primary_season="Kharif", weather_city="Parbhani",
         common_crops=["Soybean","Cotton","Pigeonpeas","Wheat"],
     ),
-    # ── Western Maharashtra ──────────────────────────────────────────
     "Pune": dict(
         region="Western Maharashtra", typical_soil_type="Black Soil",
         npk_range=dict(N_low=55,N_high=80,P_low=40,P_high=70,K_low=70,K_high=115),
@@ -944,7 +890,6 @@ DISTRICT_DATA: dict[str, dict] = {
         primary_season="Kharif", weather_city="Kolhapur",
         common_crops=["Sugarcane","Rice","Groundnut","Soybean"],
     ),
-    # ── Konkan ───────────────────────────────────────────────────────
     "Raigad": dict(
         region="Konkan", typical_soil_type="Laterite Soil",
         npk_range=dict(N_low=22,N_high=45,P_low=12,P_high=28,K_low=35,K_high=65),
@@ -987,7 +932,6 @@ DISTRICT_DATA: dict[str, dict] = {
         primary_season="Kharif", weather_city="Mumbai",
         common_crops=["Vegetables","Rice"],
     ),
-    # ── Northern Maharashtra ─────────────────────────────────────────
     "Dhule": dict(
         region="Northern Maharashtra", typical_soil_type="Red Soil",
         npk_range=dict(N_low=25,N_high=50,P_low=15,P_high=35,K_low=42,K_high=75),

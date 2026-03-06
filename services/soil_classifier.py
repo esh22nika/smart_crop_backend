@@ -2,59 +2,51 @@
 Soil Classifier — wraps the local Pixsoil SavedModel (11 classes).
 Falls back to a colour-heuristic when the model isn't available.
 
+FIX: Added robust image validation that doesn't rely on MIME type headers,
+     since Android/iOS devices often send 'application/octet-stream' for
+     camera captures.
+
 Model architecture (confirmed from keras_metadata.pb):
   Input  : 256×256×3  float32  [0, 1]   (key: 'conv2d_62_input')
   Layers : 4× Conv2D(29 filters) + MaxPool → Flatten → Dense(29,29,29,11) → Softmax
   Output : 11 classes (softmax probabilities)
 
 Pixsoil label order — from the JS export (DO NOT REORDER):
-  0: alike       ← ambiguous / mixed signal  ┐
-  1: clay                                     │ actual soil types
-  2: dry rocky                                │
-  3: grassy      ← vegetated surface          ├ non-soil context labels
-  4: gravel                                   │
-  5: humus                                    │
-  6: loam                                     │
-  7: not         ← non-soil image             ┘
+  0: alike       ← ambiguous / mixed signal
+  1: clay
+  2: dry rocky
+  3: grassy      ← vegetated surface
+  4: gravel
+  5: humus
+  6: loam
+  7: not         ← non-soil image
   8: sandy
   9: silty
  10: yellow      ← laterite / iron-rich (Deccan / Konkan context)
-
-Notes:
-  • 'alike', 'grassy', 'not' are quality/context labels — not soil types.
-    When the model predicts these the classifier uses the runner-up valid class
-    or falls back to the colour heuristic.
-  • 'yellow' = laterite in Maharashtra context (Konkan belt).
-  • Model expects pixel_value / 255.0  — NO ImageNet mean/std normalisation.
 """
 
 import io
 import os
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 # ── 11 Pixsoil class labels (JS export order — must not change) ───────
 SOIL_LABELS: list[str] = [
-    "alike",      # 0 — non-agronomic, triggers fallback
+    "alike",      # 0
     "clay",       # 1
     "dry rocky",  # 2
-    "grassy",     # 3 — non-agronomic, triggers fallback
+    "grassy",     # 3
     "gravel",     # 4
     "humus",      # 5
     "loam",       # 6
-    "not",        # 7 — non-agronomic, triggers fallback
+    "not",        # 7
     "sandy",      # 8
     "silty",      # 9
     "yellow",     # 10
 ]
 
-# Labels that are NOT real soil predictions → attempt runner-up or fallback
 _INVALID_LABELS: set[str] = {"alike", "grassy", "not"}
 
-# ── Agronomic profiles keyed on Pixsoil label ────────────────────────
-# NPK in mg/kg (ppm), pH range, best crops for Maharashtra context.
-# Sources: ICAR Soil Health Card norms, NBSS&LUP Maharashtra atlas,
-#          Krishi Vigyan Kendra advisory bulletins.
 SOIL_PROFILES: dict[str, dict] = {
     "clay": dict(
         display_name="Clay Soil",
@@ -129,7 +121,6 @@ SOIL_PROFILES: dict[str, dict] = {
             "Needs lime and organic matter for most crops."
         ),
     ),
-    # ── Fallback for truly unclassifiable images ──────────────────────
     "_unknown": dict(
         display_name="Mixed / Unknown Soil",
         N=(40, 70), P=(25, 50), K=(55, 95), pH=(6.0, 7.5),
@@ -138,7 +129,6 @@ SOIL_PROFILES: dict[str, dict] = {
     ),
 }
 
-# Friendly short names for UI chips
 SHORT_NAME: dict[str, str] = {
     "clay"       : "Clay",
     "dry rocky"  : "Dry Rocky",
@@ -148,16 +138,38 @@ SHORT_NAME: dict[str, str] = {
     "sandy"      : "Sandy",
     "silty"      : "Silty/Alluvial",
     "yellow"     : "Laterite",
-    # context labels (shown only if everything fails)
     "alike"      : "Mixed",
     "grassy"     : "Vegetated Surface",
     "not"        : "Non-soil Image",
 }
 
-# Indices that ARE valid soil classes
 _VALID_INDICES: list[int] = [
     i for i, lbl in enumerate(SOIL_LABELS) if lbl not in _INVALID_LABELS
 ]
+
+
+def _validate_and_open_image(image_bytes: bytes) -> Image.Image:
+    """
+    Opens and validates image bytes using Pillow.
+    Raises ValueError with a user-friendly message if invalid.
+    This is the single source of truth for image validation —
+    we do NOT rely on MIME type headers from the HTTP request,
+    since mobile camera images frequently arrive as
+    'application/octet-stream' or with no content-type at all.
+    """
+    if len(image_bytes) < 100:
+        raise ValueError("Image data is too small or empty")
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()  # Force decode — catches truncated files
+        return img.convert("RGB")
+    except UnidentifiedImageError:
+        raise ValueError(
+            "Could not identify image format. "
+            "Please use JPEG or PNG taken in natural lighting."
+        )
+    except Exception as e:
+        raise ValueError(f"Image could not be opened: {e}")
 
 
 class SoilClassifier:
@@ -165,11 +177,10 @@ class SoilClassifier:
 
     def __init__(self):
         self.model   = None
-        self._infer  = None   # cached serving_default callable
+        self._infer  = None
         self.source  = "color_heuristic"
         self._load()
 
-    # ── Model loading ────────────────────────────────────────────────
     def _load(self):
         try:
             import tensorflow as tf
@@ -185,29 +196,38 @@ class SoilClassifier:
         except Exception as e:
             print(f"⚠️  Pixsoil load error: {e}. Using colour heuristic.")
 
-    # ── Public API ───────────────────────────────────────────────────
     def classify(self, image_bytes: bytes) -> dict:
-        """Classify soil from raw image bytes. Returns a full result dict."""
-        if self.model is not None:
-            return self._run_model(image_bytes)
-        return self._color_heuristic(image_bytes)
+        """
+        Classify soil from raw image bytes.
+        FIX: Validates image using Pillow (not MIME type) before classification.
+        """
+        # Validate image first — raises ValueError with friendly message if bad
+        try:
+            img = _validate_and_open_image(image_bytes)
+        except ValueError as e:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail=str(e))
 
-    # ── TF model inference ───────────────────────────────────────────
+        if self.model is not None:
+            return self._run_model_from_img(img, image_bytes)
+        return self._color_heuristic_from_img(img)
+
     def _run_model(self, image_bytes: bytes) -> dict:
+        """Legacy entry point — redirects to classify()."""
+        return self.classify(image_bytes)
+
+    def _run_model_from_img(self, img: Image.Image, image_bytes: bytes) -> dict:
+        """Run TF model inference on a pre-opened PIL Image."""
         import tensorflow as tf
         try:
-            img = (Image.open(io.BytesIO(image_bytes))
-                   .convert("RGB")
-                   .resize((256, 256), Image.BILINEAR))
+            resized = img.resize((256, 256), Image.BILINEAR)
+            arr = np.expand_dims(
+                np.array(resized, dtype=np.float32) / 255.0, axis=0
+            )
 
-            # Normalise to [0, 1] — no ImageNet mean/std
-            arr = np.expand_dims(np.array(img, dtype=np.float32) / 255.0, axis=0)
-
-            # Input signature key confirmed from saved_model.pb proto
             out_dict = self._infer(**{"conv2d_62_input": tf.constant(arr)})
-            probs    = list(out_dict.values())[0].numpy()[0]   # shape (11,)
+            probs    = list(out_dict.values())[0].numpy()[0]
 
-            # Model output is already softmax; verify sum ≈ 1
             if abs(probs.sum() - 1.0) > 0.05:
                 probs = _softmax(probs)
 
@@ -215,58 +235,58 @@ class SoilClassifier:
             label   = SOIL_LABELS[top_idx]
             conf    = float(probs[top_idx]) * 100.0
 
-            # If primary prediction is a context label, try best valid class
             if label in _INVALID_LABELS:
                 best_valid = max(_VALID_INDICES, key=lambda i: probs[i])
-                if probs[best_valid] >= 0.20:          # at least 20 % confidence
+                if probs[best_valid] >= 0.20:
                     label = SOIL_LABELS[best_valid]
                     conf  = float(probs[best_valid]) * 100.0
                     print(f"  Context label predicted — using runner-up: {label} ({conf:.1f}%)")
                 else:
                     print("  Low confidence on all valid soil labels — falling back to colour heuristic.")
-                    return self._color_heuristic(image_bytes)
+                    return self._color_heuristic_from_img(img)
 
             return self._build_result(label, conf, "pixsoil_local")
 
         except Exception as e:
             print(f"Pixsoil inference error: {e}")
-            return self._color_heuristic(image_bytes)
+            return self._color_heuristic_from_img(img)
 
-    # ── Colour heuristic fallback ─────────────────────────────────────
-    # Tuned to map average RGB statistics to the 8 usable Pixsoil labels.
     def _color_heuristic(self, image_bytes: bytes) -> dict:
-        img = (Image.open(io.BytesIO(image_bytes))
-               .convert("RGB")
-               .resize((64, 64)))
-        arr        = np.array(img, dtype=np.float32)
-        r, g, b    = arr[:, :, 0].mean(), arr[:, :, 1].mean(), arr[:, :, 2].mean()
+        """Legacy entry point for colour heuristic."""
+        img = _validate_and_open_image(image_bytes)
+        return self._color_heuristic_from_img(img)
+
+    def _color_heuristic_from_img(self, img: Image.Image) -> dict:
+        """Colour heuristic on a pre-opened PIL Image."""
+        small  = img.resize((64, 64))
+        arr    = np.array(small, dtype=np.float32)
+        r, g, b = arr[:, :, 0].mean(), arr[:, :, 1].mean(), arr[:, :, 2].mean()
         brightness = (r + g + b) / 3.0
-        redness    = r / (g + 1)          # red-to-green ratio
+        redness    = r / (g + 1)
 
         if brightness < 55:
-            label, conf = "humus",      60.0   # very dark → organic/humus
+            label, conf = "humus",      60.0
         elif brightness < 75:
-            label, conf = "clay",       62.0   # dark, moist clay
+            label, conf = "clay",       62.0
         elif redness > 1.4 and brightness < 130:
-            label, conf = "yellow",     63.0   # iron-rich laterite
+            label, conf = "yellow",     63.0
         elif redness > 1.2 and brightness > 130:
-            label, conf = "dry rocky",  58.0   # pale reddish rocky
+            label, conf = "dry rocky",  58.0
         elif brightness > 170 and r > 155 and g > 140:
-            label, conf = "sandy",      60.0   # pale, uniform → sandy
+            label, conf = "sandy",      60.0
         elif b > g and brightness < 130:
-            label, conf = "clay",       60.0   # blue-grey → heavy clay
+            label, conf = "clay",       60.0
         elif g > r * 0.95 and 110 < brightness < 165:
-            label, conf = "loam",       59.0   # balanced mid-brown
+            label, conf = "loam",       59.0
         elif 100 < brightness < 160 and abs(r - g) < 25:
-            label, conf = "silty",      59.0   # uniform mid-tone → alluvial
+            label, conf = "silty",      59.0
         elif brightness < 100 and redness < 1.1:
-            label, conf = "gravel",     55.0   # dark coarse
+            label, conf = "gravel",     55.0
         else:
-            label, conf = "loam",       52.0   # safe fallback
+            label, conf = "loam",       52.0
 
         return self._build_result(label, conf, "color_heuristic")
 
-    # ── Result builder ───────────────────────────────────────────────
     def _build_result(self, label: str, conf: float, source: str) -> dict:
         profile  = SOIL_PROFILES.get(label, SOIL_PROFILES["_unknown"])
         n_mid    = (profile["N"][0] + profile["N"][1]) // 2
@@ -292,7 +312,6 @@ class SoilClassifier:
         }
 
 
-# ── Utility ───────────────────────────────────────────────────────────
 def _softmax(x: np.ndarray) -> np.ndarray:
     e = np.exp(x - x.max())
     return e / e.sum()
